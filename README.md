@@ -9,7 +9,7 @@ A small library for `multipart/form-data` requests.
 ## Roadmap
 
 Even if the library is usable in almost all cases, I'm working on adding these
-features: header encoding, streams and request length evaluation (used for
+features: header encoding and request length evaluation (used for
 `Content-Length` header).
 
 ## License

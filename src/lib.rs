@@ -30,6 +30,9 @@ use http0 as http;
 #[cfg(feature = "http1")]
 use http1 as http;
 
+#[cfg(feature = "stream")]
+use futures::{stream::BoxStream, Stream, StreamExt, TryStream, TryStreamExt};
+
 use bytes::{Bytes, BytesMut};
 use http::{
     header::{IntoHeaderName, InvalidHeaderValue},
@@ -42,6 +45,9 @@ use mime::Mime;
 pub enum Error {
     #[error(transparent)]
     InvalidHeaderValue(InvalidHeaderValue),
+    #[cfg(feature = "stream")]
+    #[error(transparent)]
+    StreamError(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// A `multipart/form-data` request.
@@ -93,45 +99,13 @@ impl Multipart {
             .map_err(Error::InvalidHeaderValue)
     }
 
+    #[cfg(not(feature = "stream"))]
     /// Convert the message in a buffer.
     pub fn into_bytes(self) -> Bytes {
         let mut buffer = BytesMut::new();
 
         for part in self.parts {
-            buffer.extend_from_slice(b"--");
-            buffer.extend_from_slice(self.boundary.as_bytes());
-            buffer.extend_from_slice(b"\r\n");
-
-            buffer.extend_from_slice(b"Content-Disposition: form-data; ");
-            buffer.extend_from_slice(b"name=\"");
-            buffer.extend_from_slice(part.name.as_bytes());
-            buffer.extend_from_slice(b"\"");
-            if let Some(filename) = part.filename {
-                buffer.extend_from_slice(b"; filename=\"");
-                buffer.extend_from_slice(filename.as_bytes());
-                buffer.extend_from_slice(b"\"");
-            }
-            buffer.extend_from_slice(b"\r\n");
-
-            if let Some(mime) = part.mime {
-                buffer.extend_from_slice(b"Content-Type: ");
-                buffer.extend_from_slice(mime.as_ref().as_bytes());
-                buffer.extend_from_slice(b"\r\n");
-            }
-
-            for (header_name, header_value) in part.headers.iter() {
-                buffer.extend_from_slice(header_name.as_str().as_bytes());
-                buffer.extend_from_slice(b": ");
-                buffer.extend_from_slice(header_value.as_bytes());
-                buffer.extend_from_slice(b"\r\n");
-            }
-
-            buffer.extend_from_slice(b"\r\n");
-
-            match part.content {
-                Content::Buffer(bytes) => buffer.extend_from_slice(&bytes),
-            }
-            buffer.extend_from_slice(b"\r\n");
+            part.into_bytes(&self.boundary, &mut buffer);
         }
 
         buffer.extend_from_slice(b"--");
@@ -139,6 +113,45 @@ impl Multipart {
         buffer.extend_from_slice(b"--\r\n");
 
         buffer.freeze()
+    }
+
+    #[cfg(feature = "stream")]
+    /// Create a stream with the content of the body.
+    pub fn into_stream(self) -> impl Stream<Item = Result<Bytes, Error>> {
+        use futures::{
+            future::ready,
+            stream::{empty, once},
+        };
+
+        let boundary = self.boundary;
+        let parts = self
+            .parts
+            .into_iter()
+            .map(|part| part.into_stream(&boundary))
+            .fold(empty().boxed(), |init, last| init.chain(last).boxed());
+
+        let mut buffer = BytesMut::new();
+        buffer.extend_from_slice(b"--");
+        buffer.extend_from_slice(boundary.as_bytes());
+        buffer.extend_from_slice(b"--\r\n");
+        let tail = buffer.freeze();
+
+        parts.chain(once(ready(Ok(tail))))
+    }
+
+    #[cfg(feature = "stream")]
+    /// Convert the message in a buffer.
+    pub async fn into_bytes(self) -> Result<Bytes, Error> {
+        use futures::future::ready;
+
+        let buffer = BytesMut::new();
+        self.into_stream()
+            .try_fold(buffer, |mut buffer, bytes| {
+                buffer.extend_from_slice(&bytes);
+                ready(Ok(buffer))
+            })
+            .await
+            .map(BytesMut::freeze)
     }
 }
 
@@ -160,6 +173,9 @@ pub struct Part {
 enum Content {
     /// Content stored in a buffer.
     Buffer(Bytes),
+    #[cfg(feature = "stream")]
+    /// Stream content
+    Stream(BoxStream<'static, Result<Bytes, Error>>),
 }
 
 impl Part {
@@ -197,7 +213,7 @@ impl Part {
         }
     }
 
-    /// Create a new part with binary content (`application/octet-stream`)
+    /// Create a new part with binary content (`application/octet-stream`).
     pub fn bytes<T, U>(name: T, value: U) -> Self
     where
         T: Into<Cow<'static, str>>,
@@ -213,6 +229,29 @@ impl Part {
             filename: None,
             mime: Some(mime::APPLICATION_OCTET_STREAM),
             content: Content::Buffer(bytes),
+            headers: HeaderMap::new(),
+        }
+    }
+
+    #[cfg(feature = "stream")]
+    /// Create a new part with stream content (`application/octet-stream`).
+    pub fn stream<T, U>(name: T, value: U) -> Self
+    where
+        T: Into<Cow<'static, str>>,
+        U: TryStream + Send + 'static,
+        Bytes: From<U::Ok>,
+        U::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let stream = value
+            .map_ok(Bytes::from)
+            .map_err(|err| Error::StreamError(err.into()))
+            .boxed();
+
+        Self {
+            name: name.into(),
+            filename: None,
+            mime: Some(mime::APPLICATION_OCTET_STREAM),
+            content: Content::Stream(stream),
             headers: HeaderMap::new(),
         }
     }
@@ -247,6 +286,74 @@ impl Part {
         let value = value.try_into().map_err(Error::InvalidHeaderValue)?;
         self.headers.insert(name, value);
         Ok(self)
+    }
+
+    /// Write in the buffer the headers of this part.
+    fn headers_into_bytes(&self, boundary: &str, buffer: &mut BytesMut) {
+        buffer.extend_from_slice(b"--");
+        buffer.extend_from_slice(boundary.as_bytes());
+        buffer.extend_from_slice(b"\r\n");
+
+        buffer.extend_from_slice(b"Content-Disposition: form-data; ");
+        buffer.extend_from_slice(b"name=\"");
+        buffer.extend_from_slice(self.name.as_bytes());
+        buffer.extend_from_slice(b"\"");
+        if let Some(filename) = self.filename.as_deref() {
+            buffer.extend_from_slice(b"; filename=\"");
+            buffer.extend_from_slice(filename.as_bytes());
+            buffer.extend_from_slice(b"\"");
+        }
+        buffer.extend_from_slice(b"\r\n");
+
+        if let Some(mime) = self.mime.as_ref() {
+            buffer.extend_from_slice(b"Content-Type: ");
+            buffer.extend_from_slice(mime.as_ref().as_bytes());
+            buffer.extend_from_slice(b"\r\n");
+        }
+
+        for (header_name, header_value) in self.headers.iter() {
+            buffer.extend_from_slice(header_name.as_str().as_bytes());
+            buffer.extend_from_slice(b": ");
+            buffer.extend_from_slice(header_value.as_bytes());
+            buffer.extend_from_slice(b"\r\n");
+        }
+
+        buffer.extend_from_slice(b"\r\n");
+    }
+
+    #[cfg(not(feature = "stream"))]
+    /// Convert this part in a buffer.
+    fn into_bytes(self, boundary: &str, buffer: &mut BytesMut) {
+        self.headers_into_bytes(boundary, buffer);
+        match self.content {
+            Content::Buffer(bytes) => buffer.extend_from_slice(&bytes),
+        }
+        buffer.extend_from_slice(b"\r\n");
+    }
+
+    #[cfg(feature = "stream")]
+    fn into_stream(self, boundary: &str) -> impl Stream<Item = Result<Bytes, Error>> {
+        use futures::{future::ready, stream::once};
+
+        let mut buffer = BytesMut::new();
+        self.headers_into_bytes(boundary, &mut buffer);
+        match self.content {
+            Content::Buffer(bytes) => {
+                buffer.extend_from_slice(&bytes);
+                buffer.extend_from_slice(b"\r\n");
+
+                let buffer = buffer.freeze();
+                futures::stream::once(ready(Ok(buffer))).boxed()
+            }
+            Content::Stream(stream) => {
+                let buffer = buffer.freeze();
+                let tail = Bytes::from_static(b"\r\n");
+                once(ready(Ok(buffer)))
+                    .chain(stream)
+                    .chain(once(ready(Ok(tail))))
+                    .boxed()
+            }
+        }
     }
 }
 
@@ -288,4 +395,76 @@ fn generate_random_boundary() -> String {
     let c = xorshit64();
     let d = xorshit64();
     format!("{a:016x}{b:016x}{c:016x}{d:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use claym::*;
+
+    fn create_multipart_parser(message: Multipart) -> multer::Multipart<'static> {
+        let content_type = assert_ok!(message.get_content_type_header());
+        let content_type = assert_ok!(content_type.to_str());
+        let boundary = assert_ok!(multer::parse_boundary(content_type));
+
+        #[cfg(feature = "stream")]
+        let parser = {
+            let body = message.into_stream();
+            multer::Multipart::new(body, boundary)
+        };
+
+        #[cfg(not(feature = "stream"))]
+        let parser = {
+            use futures::{future::ready, stream::once};
+
+            let body = message.into_bytes();
+            let body = once(ready(Ok::<_, Error>(body)));
+            multer::Multipart::new(body, boundary)
+        };
+
+        parser
+    }
+
+    #[tokio::test]
+    async fn test_multipart_empty() {
+        let message = Multipart::empty();
+        let mut parser = create_multipart_parser(message);
+        assert_matches!(assert_ok!(parser.next_field().await), None);
+    }
+
+    #[tokio::test]
+    async fn test_multipart_basic_with_stream() {
+        let message = Multipart::from_parts([
+            Part::text("my_text_field", "abcd"),
+            Part::bytes(
+                "my_file_field",
+                b"Hello world\nHello\r\nWorld\rAgain".as_slice(),
+            )
+            .with_mime(mime::TEXT_PLAIN)
+            .with_filename("a-text-file.txt"),
+        ]);
+        let mut parser = create_multipart_parser(message);
+
+        while let Some((idx, field)) = parser.next_field_with_idx().await.unwrap() {
+            if idx == 0 {
+                assert_eq!(field.name(), Some("my_text_field"));
+                assert_eq!(field.file_name(), None);
+                assert_eq!(field.content_type(), Some(&mime::TEXT_PLAIN_UTF_8));
+                assert_eq!(field.index(), 0);
+
+                assert_eq!(field.text().await, Ok("abcd".to_owned()));
+            } else if idx == 1 {
+                assert_eq!(field.name(), Some("my_file_field"));
+                assert_eq!(field.file_name(), Some("a-text-file.txt"));
+                assert_eq!(field.content_type(), Some(&mime::TEXT_PLAIN));
+                assert_eq!(field.index(), 1);
+
+                assert_eq!(
+                    field.text().await,
+                    Ok("Hello world\nHello\r\nWorld\rAgain".to_owned())
+                );
+            }
+        }
+    }
 }
